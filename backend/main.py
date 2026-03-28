@@ -6,11 +6,10 @@ Deployed on Railway (persistent server — sessions stay alive)
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from openai import OpenAI
 from dotenv import load_dotenv
-import uuid
-import os
+import uuid, os, time
 
 # ─────────────────────────────────────────────
 # App Setup
@@ -19,8 +18,6 @@ app = FastAPI(title="Context-Aware Chatbot API")
 
 load_dotenv()
 
-# Read allowed origins from env (set in Railway dashboard)
-# Falls back to localhost for local dev
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,http://localhost:3000"
@@ -35,12 +32,22 @@ app.add_middleware(
 )
 
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
 # ─────────────────────────────────────────────
 # In-Memory Session Store
-# Works perfectly on Railway (real persistent server)
-# { session_id: [{"role": "...", "content": "..."}, ...] }
+# { session_id: { "history": [...], "last_active": float } }
 # ─────────────────────────────────────────────
-sessions: dict[str, list[dict]] = {}
+sessions: dict[str, dict] = {}
+
+SESSION_TTL_SECONDS = 60 * 60  # 1 hour — stale sessions auto-expire on next request
+
+def _evict_stale_sessions():
+    """Remove sessions that haven't been used for SESSION_TTL_SECONDS."""
+    now = time.time()
+    stale = [sid for sid, data in sessions.items()
+             if now - data["last_active"] > SESSION_TTL_SECONDS]
+    for sid in stale:
+        del sessions[sid]
 
 # ─────────────────────────────────────────────
 # System Prompt (Prompt Engineering)
@@ -72,16 +79,10 @@ SYSTEM_PROMPT = """You are a precise, context-aware AI assistant. Follow these r
 
 # ─────────────────────────────────────────────
 # Token Optimization Utility
-# Keeps the last N exchanges to stay within context limits.
 # ─────────────────────────────────────────────
 MAX_EXCHANGES = 10  # last 10 user+assistant pairs = 20 messages
 
 def optimize_context(messages: list[dict]) -> list[dict]:
-    """
-    Truncate conversation history to the most recent MAX_EXCHANGES turns.
-    Each 'exchange' = 1 user message + 1 assistant message (2 items).
-    The system prompt is never included here — it's prepended at call time.
-    """
     max_messages = MAX_EXCHANGES * 2
     if len(messages) > max_messages:
         messages = messages[-max_messages:]
@@ -93,6 +94,17 @@ def optimize_context(messages: list[dict]) -> list[dict]:
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+
+    # NEW: reject empty or excessively long messages before hitting the LLM
+    @field_validator("message")
+    @classmethod
+    def message_must_be_valid(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Message cannot be empty.")
+        if len(v) > 4000:
+            raise ValueError("Message too long. Please keep it under 4000 characters.")
+        return v
 
 class ChatResponse(BaseModel):
     session_id: str
@@ -109,8 +121,9 @@ class NewSessionResponse(BaseModel):
 @app.get("/session/new", response_model=NewSessionResponse)
 def create_session():
     """Generate a new session ID and initialize empty history."""
+    _evict_stale_sessions()
     session_id = str(uuid.uuid4())
-    sessions[session_id] = []
+    sessions[session_id] = {"history": [], "last_active": time.time()}
     return {"session_id": session_id}
 
 
@@ -123,11 +136,14 @@ def chat(req: ChatRequest):
     session_id = req.session_id
 
     if session_id not in sessions:
-        sessions[session_id] = []
+        # Auto-create session if missing (e.g. after a server restart)
+        sessions[session_id] = {"history": [], "last_active": time.time()}
 
-    history = sessions[session_id]
+    data = sessions[session_id]
+    history = data["history"]
+    data["last_active"] = time.time()
+
     history.append({"role": "user", "content": req.message})
-
     optimized_history = optimize_context(history)
 
     messages_to_send = [
@@ -142,6 +158,8 @@ def chat(req: ChatRequest):
             max_tokens=1024,
         )
     except Exception as e:
+        # Remove the user message we just appended so history stays consistent
+        history.pop()
         raise HTTPException(status_code=502, detail=f"LLM API error: {str(e)}")
 
     assistant_reply = response.choices[0].message.content
@@ -152,6 +170,15 @@ def chat(req: ChatRequest):
         reply=assistant_reply,
         history_length=len(history),
     )
+
+
+# NEW: let the frontend fetch and display full chat history
+@app.get("/session/{session_id}/history")
+def get_history(session_id: str):
+    """Return the full conversation history for a session."""
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"history": sessions[session_id]["history"]}
 
 
 @app.delete("/session/{session_id}")

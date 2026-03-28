@@ -25,6 +25,13 @@ export async function clearSession(sessionId) {
   await fetch(`${BASE}/session/${sessionId}`, { method: "DELETE" });
 }
 
+// NEW: fetch full history (useful for page refresh recovery)
+export async function getHistory(sessionId) {
+  const res = await fetch(`${BASE}/session/${sessionId}/history`);
+  if (!res.ok) return null;
+  return res.json(); // { history: [{role, content}, ...] }
+}
+
 export async function checkHealth() {
   const res = await fetch(`${BASE}/health`);
   return res.ok;
