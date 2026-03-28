@@ -18,19 +18,13 @@ app = FastAPI(title="Context-Aware Chatbot API")
 
 load_dotenv()
 
-ALLOWED_ORIGINS = os.environ.get(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000"
-).split(",")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ─────────────────────────────────────────────
